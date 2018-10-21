@@ -6,4 +6,6 @@ python:
 #- "3.7"
 install:
 - pip install . .[dev]
-script: pytest
+script:
+- pytest
+- pylint jenkins_update_center_helper

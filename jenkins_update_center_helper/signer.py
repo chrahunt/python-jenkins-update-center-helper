@@ -1,3 +1,5 @@
+"""Signing functions for generating Jenkins-compatible JSON files.
+"""
 import base64
 import binascii
 import copy
@@ -10,7 +12,7 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, utils
 from cryptography.hazmat.primitives.asymmetric.rsa import (
-        RSAPrivateKey, RSAPrivateKeyWithSerialization)
+    RSAPrivateKey, RSAPrivateKeyWithSerialization)
 
 
 PathType = Union[str, Path]
@@ -21,40 +23,48 @@ CertsType = List[CertType]
 CertInput = Union[str, bytes, CertType]
 
 
-def sign(
-        json_data: Optional[dict]=None,
-        json_data_path: Optional[PathType]=None,
-        key: Optional[KeyInput]=None,
-        key_path: Optional[PathType]=None,
-        password: Optional[Union[str, bytes]]=None,
-        certificate: Optional[CertInput]=None,
-        certificate_path: Optional[PathType]=None) -> dict:
-    """Sign provided json object and return with embedded
-    signature.
+def sign( # pylint: disable=too-many-arguments
+        json_data: Optional[Union[dict, str, bytes]] = None,
+        json_data_path: Optional[PathType] = None,
+        key: Optional[KeyInput] = None,
+        key_path: Optional[PathType] = None,
+        password: Optional[Union[str, bytes]] = None,
+        certificate: Optional[CertInput] = None,
+        certificate_path: Optional[PathType] = None) -> bytes:
+    """Generate Jenkins-compatible signed JSON data.
+
+    The signature is embedded in the returned value.
 
     This method requires the json, a private key, and a certificate.
     Either the values themselves can be provided or paths to them
     (using the `_path`-suffixed variables).
     """
-    if json_data is not None:
-        obj = copy.deepcopy(json_data)
-    elif json_data_path is not None:
-        with open(json_data_path, encoding='utf-8') as f:
-            obj = json.load(f)
-    else:
-        raise ValueError(
-            'One of `json_data` or `json_data_path` must be provided.')
-
     def get_arg_or_path(arg, path_arg):
         if arg is None and path_arg is not None:
             return Path(path_arg).read_bytes()
         return arg
 
+    # Handle json.
+    json_data = get_arg_or_path(json_data, json_data_path)
+    if json_data is None:
+        raise ValueError(
+            'One of `json_data` or `json_data_path` must be provided.')
+
+    if isinstance(json_data, (bytes, str)):
+        json_obj = json.loads(json_data)
+    elif isinstance(json_data, dict):
+        # Prevent mutating caller's object.
+        json_obj = copy.deepcopy(json_data)
+    else:
+        raise TypeError(
+            f'Parameter `json_data` has unexpected type {type(json_data)}')
+
     def ensure_bytes(arg):
-        if type(arg) == str:
+        if isinstance(arg, str):
             return arg.encode('utf-8')
-        if type(arg) == bytes:
+        if isinstance(arg, bytes):
             return arg
+        return None
 
     # Handle private key.
     key = get_arg_or_path(key, key_path)
@@ -67,7 +77,7 @@ def sign(
         key = _decode_private_key(key_bytes, password_bytes)
 
     if not issubclass(type(key), RSAPrivateKey):
-        raise ValueError('Unknown type for key')
+        raise TypeError(f'Parameter `key` has unexpected type {type(key)}')
 
     # Handle certificate.
     certificate = get_arg_or_path(certificate, certificate_path)
@@ -80,13 +90,19 @@ def sign(
         certificate = _decode_certificate(certificate_bytes)
 
     if not issubclass(type(certificate), x509.Certificate):
-        raise ValueError('Unknown type for certificate')
+        raise TypeError(
+            f'Parameter `certificate` has unexpected type {type(certificate)}')
 
-    return sign_internal(obj, key, [certificate])
+    return canonicalize_json(sign_internal(json_obj, key, [certificate]))
 
 
 def sign_internal(
         obj: dict, key: KeyType, certificates: CertsType) -> dict:
+    """Sign and embed signature, aligning with update-center2 implementation.
+
+    The signature block is embedded in the provided object, which is also
+    returned.
+    """
     def _sign(data, hash_type):
         hasher = hashes.Hash(hash_type, default_backend())
         hasher.update(data)
@@ -110,33 +126,49 @@ def sign_internal(
     def _simulate_unflushed_stream(data):
         # OutputStreamWriter flushes at 8192 byte boundaries so we take all
         # but the last unfilled chunk.
-        BUF_SIZE = 8192
-        return data[:len(data) - (len(data) % BUF_SIZE)]
+        buf_size = 8192
+        return data[:len(data) - (len(data) % buf_size)]
 
     def _convert_certificate(cert):
         return base64.b64encode(
             cert.public_bytes(
                 encoding=serialization.Encoding.DER)).decode('utf-8')
 
-    # Hash calculation does not include the signature block.
+    # update-center2 performs the following to sign the JSON files staged at
+    # updates.jenkins.io:
+    # 1. Canonicalization of JSON
+    # 2. Digest generation
+    # 3. Sign digest
+    # 4. Embed digest, signature, and certificates into JSON.
+
+    # Digest calculation does not include the signature block.
     obj.pop('signature', None)
-    # As mentioned in
-    # https://github.com/jenkins-infra/update-center2/blob/f607589ab50d9c8d09ba84e0ed358b077abd0754/src/main/java/org/jvnet/hudson/update_center/Signer.java#L111
     # the un-prefixed keys of the signature block were for older (<1.433,
     # pre-2011) versions of Jenkins that did not flush their output stream.
-    s = _canonicalize_json(obj)
+    json_bytes = canonicalize_json(obj)
 
-    signature = {
-        'certificates': [_convert_certificate(c) for c in certificates]
-    }
-    signature.update(_make_signature(_simulate_unflushed_stream(s)))
-    signature.update(_make_signature(s, 'correct_'))
+    signature = {}
+    # As mentioned in
+    # https://github.com/jenkins-infra/update-center2/blob/f607589ab50d9c8d09ba84e0ed358b077abd0754/src/main/java/org/jvnet/hudson/update_center/Signer.java#L111
+    # prior to Jenkins 1.433, the implementation was not flushing the output
+    # stream prior to finalizing the digest, leaving some bytes off the end.
+    # The digest and signature fields were left as-is for that incorrect
+    # implementation, and new prefixed versions were introduced which have
+    # the digests and signatures generated from the full contents.
+    signature.update(_make_signature(_simulate_unflushed_stream(json_bytes)))
+    signature.update(_make_signature(json_bytes, 'correct_'))
+    signature['certificates'] = [
+        _convert_certificate(c) for c in certificates]
+
     obj['signature'] = signature
 
     return obj
 
 
-def _canonicalize_json(obj):
+def canonicalize_json(obj: dict) -> bytes:
+    """Generate JSON output compatible with
+    net.sf.json.JSONObject.writeCanonical.
+    """
     return json.dumps(
         obj,
         # Remove spaces from around separators.
@@ -147,19 +179,19 @@ def _canonicalize_json(obj):
 
 
 def _decode_private_key(data, password=None):
-    fn = serialization.load_pem_private_key
+    loader = serialization.load_pem_private_key
     if _is_der(data):
-        fn = serialization.load_der_private_key
-    return fn(data, password=password, backend=default_backend())
+        loader = serialization.load_der_private_key
+    return loader(data, password=password, backend=default_backend())
 
 
 def _decode_certificate(data):
-    fn = x509.load_pem_x509_certificate
+    loader = x509.load_pem_x509_certificate
     if _is_der(data):
-        fn = x509.load_der_x509_certificate
-    return fn(data, backend=default_backend())
+        loader = x509.load_der_x509_certificate
+    return loader(data, backend=default_backend())
 
 
 def _is_der(data):
-    DER_MAGIC = b"\x30\x82"
-    return data.startswith(DER_MAGIC)
+    der_magic = b"\x30\x82"
+    return data.startswith(der_magic)

@@ -22,7 +22,8 @@ def test_signing(isolated_fs):
     obj = json.loads(f.read_text(encoding='utf-8'))
     signature = obj['signature']
     key, cert = generate_self_signed_cert()
-    signed_data = signer.sign(obj, key=key, certificate=cert)
+    signed_data_bytes = signer.sign(obj, key=key, certificate=cert)
+    signed_data = json.loads(signed_data_bytes)
     assert (
         signed_data['signature']['digest'] ==
         signature['digest'])

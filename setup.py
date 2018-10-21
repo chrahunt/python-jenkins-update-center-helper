@@ -15,6 +15,7 @@ setup(
     description='helper for working with jenkins update-center.json',
     extras_require={
         'dev': [
+            'pylint ~= 2.1.1',
             'pytest ~= 3.9',
             'twine >= 1.11.0',
         ],
