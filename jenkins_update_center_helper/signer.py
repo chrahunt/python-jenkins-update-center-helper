@@ -3,46 +3,47 @@ import binascii
 import copy
 import json
 from pathlib import Path
-from typing import Optional, Type, Union
+from typing import List, Optional, Union
 
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, utils
-from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, RSAPrivateKeyWithSerialization
+from cryptography.hazmat.primitives.asymmetric.rsa import (
+        RSAPrivateKey, RSAPrivateKeyWithSerialization)
 
 
 PathType = Union[str, Path]
 KeyType = Union[RSAPrivateKeyWithSerialization, RSAPrivateKey]
+KeyInput = Union[str, bytes, KeyType]
 CertType = x509.Certificate
+CertsType = List[CertType]
+CertInput = Union[str, bytes, CertType]
 
 
 def sign(
-        update_center_json: Optional[dict]=None,
-        update_center_json_path: Optional[PathType]=None,
-        key: Optional[Union[str, bytes, KeyType]]=None,
+        json_data: Optional[dict]=None,
+        json_data_path: Optional[PathType]=None,
+        key: Optional[KeyInput]=None,
         key_path: Optional[PathType]=None,
         password: Optional[Union[str, bytes]]=None,
-        certificate: Optional[Union[str, bytes, CertType]]=None,
+        certificate: Optional[CertInput]=None,
         certificate_path: Optional[PathType]=None) -> dict:
-    """Sign provided update-center.json object and return with embedded 
+    """Sign provided json object and return with embedded
     signature.
 
-    This method requires the update-center json, a private key, and a
-    certificate. Either the values themselves can be provided or paths to
-    them (using the `_path` variables).
-    :param update_center_json the object derived from update-center.json.
-    :param update_center_json_path the object derived from update-center.json.
+    This method requires the json, a private key, and a certificate.
+    Either the values themselves can be provided or paths to them
+    (using the `_path`-suffixed variables).
     """
-    if update_center_json is not None:
-        obj = copy.deepcopy(update_center_json)
-    elif update_center_json_path is not None:
-        with open(update_center_json_path, encoding='utf-8') as f:
+    if json_data is not None:
+        obj = copy.deepcopy(json_data)
+    elif json_data_path is not None:
+        with open(json_data_path, encoding='utf-8') as f:
             obj = json.load(f)
     else:
         raise ValueError(
-            'One of `upate_center_json` or `update_center_json_path` must be'
-            ' provided.')
+            'One of `json_data` or `json_data_path` must be provided.')
 
     def get_arg_or_path(arg, path_arg):
         if arg is None and path_arg is not None:
@@ -81,13 +82,14 @@ def sign(
     if not issubclass(type(certificate), x509.Certificate):
         raise ValueError('Unknown type for certificate')
 
-    return really_sign(obj, key, certificate)
+    return sign_internal(obj, key, [certificate])
 
 
-def really_sign(obj: dict, key: KeyType, certificate: CertType) -> dict:
-    def _sign(hash_type):
+def sign_internal(
+        obj: dict, key: KeyType, certificates: CertsType) -> dict:
+    def _sign(data, hash_type):
         hasher = hashes.Hash(hash_type, default_backend())
-        hasher.update(s)
+        hasher.update(data)
         digest = hasher.finalize()
         # PKCS1v15 is used for compatibility with the SHA*withRSA used in
         # update-center2.
@@ -95,26 +97,53 @@ def really_sign(obj: dict, key: KeyType, certificate: CertType) -> dict:
             digest, padding.PKCS1v15(), utils.Prehashed(hash_type))
         return digest, signature
 
+    def _make_signature(data, prefix=''):
+        digest1, sig1 = _sign(data, hashes.SHA1())
+        digest512, sig512 = _sign(data, hashes.SHA512())
+        return {
+            f'{prefix}digest': base64.b64encode(digest1).decode('utf-8'),
+            f'{prefix}digest512': binascii.hexlify(digest512).decode('utf-8'),
+            f'{prefix}signature': base64.b64encode(sig1).decode('utf-8'),
+            f'{prefix}signature512': binascii.hexlify(sig512).decode('utf-8'),
+        }
+
+    def _simulate_unflushed_stream(data):
+        # OutputStreamWriter flushes at 8192 byte boundaries so we take all
+        # but the last unfilled chunk.
+        BUF_SIZE = 8192
+        return data[:len(data) - (len(data) % BUF_SIZE)]
+
+    def _convert_certificate(cert):
+        return base64.b64encode(
+            cert.public_bytes(
+                encoding=serialization.Encoding.DER)).decode('utf-8')
+
+    # Hash calculation does not include the signature block.
     obj.pop('signature', None)
+    # As mentioned in
+    # https://github.com/jenkins-infra/update-center2/blob/f607589ab50d9c8d09ba84e0ed358b077abd0754/src/main/java/org/jvnet/hudson/update_center/Signer.java#L111
+    # the un-prefixed keys of the signature block were for older (<1.433,
+    # pre-2011) versions of Jenkins that did not flush their output stream.
     s = _canonicalize_json(obj)
-    digest1, sig1 = _sign(hashes.SHA1())
-    digest512, sig512 = _sign(hashes.SHA512())
+
     signature = {
-        # We only implement the 'correct_'-prefixed versions for now.
-        'correct_digest': base64.b64encode(digest1).decode('utf-8'),
-        'correct_digest512': binascii.hexlify(digest512),
-        'correct_signature': base64.b64encode(sig1).decode('utf-8'),
-        'correct_signature512': binascii.hexlify(sig512),
-        'certificate': base64.b64encode(
-            certificate.public_bytes(
-                encoding=serialization.Encoding.DER)).decode('utf-8'),
+        'certificates': [_convert_certificate(c) for c in certificates]
     }
+    signature.update(_make_signature(_simulate_unflushed_stream(s)))
+    signature.update(_make_signature(s, 'correct_'))
     obj['signature'] = signature
+
     return obj
 
 
 def _canonicalize_json(obj):
-    return json.dumps(obj, sort_keys=True).encode('utf-8')
+    return json.dumps(
+        obj,
+        # Remove spaces from around separators.
+        separators=(',', ':'),
+        # Prevent \u escapes in encoded output.
+        ensure_ascii=False,
+        sort_keys=True).encode('utf-8')
 
 
 def _decode_private_key(data, password=None):
@@ -129,7 +158,7 @@ def _decode_certificate(data):
     if _is_der(data):
         fn = x509.load_der_x509_certificate
     return fn(data, backend=default_backend())
-        
+
 
 def _is_der(data):
     DER_MAGIC = b"\x30\x82"
