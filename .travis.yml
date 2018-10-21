@@ -2,10 +2,17 @@ language: python
 cache: pip
 sudo: false
 python:
-- "3.6"
-#- "3.7"
+- '3.6'
 install:
 - pip install . .[dev]
 script:
 - pytest
 - pylint jenkins_update_center_helper
+deploy:
+  provider: pypi
+  username: chrahunt
+  password:
+    secure: 1PHABXhYxurfLlX8UGnLB0EGBixGuexzIdidpZKDVZ628P42//Y0tEAsLGW1pZGulVbh67hSTDJ47n18ycresRCuhPwPbZz6vnjTRbgqPMOk1a0oUAR/I7BppKDKZYll9fylFkYb3rFGZyx4NicMM0aNr1dezWCEauX6p/fCt25XkdzJ33sAJUHPk/jL1u52w615J8Yq3dL47Gyr+DOvyi7IOQapVM08HoyJw9cc4m7vJajzdG89bKWXJ6og1Yaj1Je58Ma9jt7xrTe5lTZTvw6UsCZWR4X6TtPUmRLiXCuGz525Owt+UW717EkbeLnBvW//Pmo1QLUngBd/aJzznq3DJ9hBxRD58b4xNl+p7KtMsDR2jx0JFDXwBciFVgdb7JhPzLLCa2QbbMdgTAyd443SyHgzdNuKkKNPMEOnIsunAka3XNiGq2JwZrb+CWnsKVH9sPIuAY8Tq6gWbg+B+QARvOd5yrS9FtpqzotamnoCUWtYmRucXvPLnLRF5YrqgQcG8JzVH3LLjI961y3Mfv8eojEQZA5mvmXwPOoOJX92/wTZqDV7d7pEDiBvV6jvmPFt2ZhQF9ExfUJbesqkRcEuxiVA0mTuTKqQbvp6ib7fi9lKN0wKIyJ33ZVSu2nI8tG9GKPoiQDhlDHOvuvMbrnZyo1KdthDgCkHoeHkxYE=
+  on:
+    tags: true
+  distributions: "sdist bdist_wheel"

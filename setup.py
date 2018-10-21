@@ -16,8 +16,9 @@ setup(
     extras_require={
         'dev': [
             'pylint ~= 2.1.1',
-            'pytest ~= 3.9',
-            'twine >= 1.11.0',
+            'pytest ~= 3.9.1',
+            'twine ~= 1.11.0',
+            'wheel ~= 0.32.2',
         ],
     },
     install_requires=[
